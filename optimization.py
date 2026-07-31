@@ -222,8 +222,9 @@ def solve_preference_order_plan(
     carrier_capacity_total: float = 8 * CARRIER_WEEKLY_CAPACITY,
     transport_loss_rate: float = 0.0,
 ) -> dict[str, object]:
-    if not 0 <= a_min_share <= 1 or not 0 <= c_max_share <= 1 or a_min_share + c_max_share > 1 + 1e-8:
-        raise ValueError("A类下限和C类上限参数不合法")
+    # A 类为最低占比、C 类为最高占比，二者不是两个最低占比，因而不要求参数之和不超过 1。
+    if not 0 <= a_min_share <= 1 or not 0 <= c_max_share <= 1:
+        raise ValueError("A类下限和C类上限参数必须在 [0, 1] 内")
     safety = float(2.0 * demand if safety_inventory is None else safety_inventory)
     initial = float(safety if initial_inventory is None else initial_inventory)
     preference = {
@@ -474,7 +475,23 @@ def preference_loss_buffer(base_loss_rate: float, loss_weight: float) -> float:
     return min(0.95, float(base_loss_rate) * (0.5 + float(loss_weight)))
 
 
-# 枚举材料比例和低损耗偏好参数组合，记录可行性和成本变化。
+# 将发运量按原料类别换算为未扣损的产品当量，用于敏感性审计。
+def shipment_product_equivalent_by_week(
+    shipments: pd.DataFrame,
+    supplier_materials: Mapping[str, str] | pd.Series,
+) -> pd.Series:
+    """将每周原料发运量换算为未扣运输损耗的产品当量。"""
+    material_map = {str(key): str(value) for key, value in dict(supplier_materials).items()}
+    values: dict[int, float] = {}
+    for week in shipments.columns:
+        total = 0.0
+        for supplier_id, volume in shipments[week].items():
+            total += float(volume) / MATERIAL_CONSUMPTION[material_map[str(supplier_id)]]
+        values[int(week)] = total
+    return pd.Series(values, name="planned_product_equivalent").sort_index()
+
+
+# 采用控制变量法开展两类问题 3 敏感性试验：材料比例网格与低损耗阈值网格。
 def run_sensitivity_grid(
     suppliers: pd.DataFrame,
     demand: float,
@@ -488,11 +505,38 @@ def run_sensitivity_grid(
     carrier_loss_rates: pd.DataFrame | None = None,
     max_loss_rate: float | None = None,
     carrier_capacity: float | pd.Series | pd.DataFrame | Mapping[str, float] = CARRIER_WEEKLY_CAPACITY,
+    loss_thresholds: Sequence[float] | None = None,
+    baseline_a_min: float | None = None,
+    baseline_c_max: float | None = None,
 ) -> pd.DataFrame:
-    """运行问题 3 的参数网格，并记录可行性、成本和材料结构指标。"""
+    """运行问题 3 的控制变量敏感性试验并记录采购、转运和库存结果。
+
+    材料比例试验固定低损耗率阈值；阈值试验固定基准 A/C 比例。
+    两类试验分开记录，避免四个参数同时变化造成结果难以解释。
+    """
+    if max_loss_rate is not None and not 0.0 <= float(max_loss_rate) < 1.0:
+        raise ValueError("低损耗率阈值必须在 [0, 1) 内")
+    threshold_values = tuple(float(value) for value in (loss_thresholds or ()))
+    if any(not 0.0 <= value < 1.0 for value in threshold_values):
+        raise ValueError("敏感性低损耗率阈值必须在 [0, 1) 内")
+    if threshold_values and max_loss_rate is None:
+        raise ValueError("提供阈值敏感性网格时必须同时提供基准低损耗率阈值")
+
+    base_a_min = float(a_min_values[0] if baseline_a_min is None else baseline_a_min)
+    base_c_max = float(c_max_values[-1] if baseline_c_max is None else baseline_c_max)
     records: list[dict[str, object]] = []
-    # 穷举参数组合，比较偏好条件变化对方案可行性和成本的影响。
-    for a_min, c_max, loss_weight in product(a_min_values, c_max_values, loss_weights):
+    supplier_materials = suppliers[MATERIAL]
+    safety_inventory = 2.0 * float(demand)
+
+    def evaluate(a_min: float, c_max: float, loss_weight: float, threshold: float | None, experiment: str) -> None:
+        record: dict[str, object] = {
+            "试验类型": experiment,
+            "A类最低占比": float(a_min),
+            "C类最高占比": float(c_max),
+            "低损耗权重": float(loss_weight),
+            "低损耗率阈值": np.nan if threshold is None else float(threshold),
+            "规划损耗缓冲率": preference_loss_buffer(transport_loss_rate, float(loss_weight)),
+        }
         try:
             result = solve_preference_order_plan(
                 suppliers,
@@ -502,28 +546,64 @@ def run_sensitivity_grid(
                 a_reward=a_reward,
                 c_penalty=c_penalty,
                 weeks=weeks,
-                transport_loss_rate=preference_loss_buffer(transport_loss_rate, float(loss_weight)),
+                initial_inventory=safety_inventory,
+                safety_inventory=safety_inventory,
+                transport_loss_rate=float(record["规划损耗缓冲率"]),
             )
-            if carrier_loss_rates is not None:
-                assign_carriers(
-                    result["shipments"],
-                    carrier_loss_rates,
-                    carrier_capacity=carrier_capacity,
-                    max_loss_rate=max_loss_rate,
-                )
             material = result["material_product_equivalent"]
             total = material.sum(axis=1)
-            records.append(
+            record.update(
                 {
-                    "A类最低占比": a_min,
-                    "C类最高占比": c_max,
-                    "低损耗权重": loss_weight,
                     "可行": True,
-                    "目标成本": result["objective"],
+                    "目标成本": float(result["objective"]),
                     "A类实际占比": float((material["A"] / total).mean()),
                     "C类实际占比": float((material["C"] / total).mean()),
                 }
             )
+            if carrier_loss_rates is None:
+                records.append(record)
+                return
+
+            allocation = assign_carriers(
+                result["shipments"],
+                carrier_loss_rates,
+                carrier_capacity=carrier_capacity,
+                max_loss_rate=threshold,
+            )
+            planned_receipts = shipment_product_equivalent_by_week(result["shipments"], supplier_materials)
+            actual_receipts = post_loss_product_equivalent_by_week(allocation, carrier_loss_rates, supplier_materials)
+            actual_inventory = inventory_from_receipts(actual_receipts, demand, safety_inventory)
+            eligible_counts = (
+                pd.Series(len(carrier_loss_rates), index=carrier_loss_rates.columns)
+                if threshold is None
+                else (carrier_loss_rates <= threshold + 1e-12).sum(axis=0)
+            )
+            used_rates: list[float] = []
+            used_carriers: set[str] = set()
+            for week, matrix in allocation.items():
+                positive = matrix.sum(axis=0) > 1e-8
+                carriers = matrix.columns[positive].astype(str).tolist()
+                used_carriers.update(carriers)
+                used_rates.extend(carrier_loss_rates[int(week)].reindex(carriers).astype(float).tolist())
+            record.update(
+                {
+                    "最少合格转运商数": int(eligible_counts.min()),
+                    "实际使用转运商数": len(used_carriers),
+                    "已使用最大预测损耗率": float(max(used_rates)) if used_rates else np.nan,
+                    "实际运输损耗产品当量": float((planned_receipts - actual_receipts).sum()),
+                    "实际最低库存": float(actual_inventory.min()),
+                    "实际安全库存裕度": float(actual_inventory.min() - safety_inventory),
+                }
+            )
         except OptimizationError as exc:
-            records.append({"A类最低占比": a_min, "C类最高占比": c_max, "低损耗权重": loss_weight, "可行": False, "原因": str(exc)})
+            record.update({"可行": False, "原因": str(exc)})
+        records.append(record)
+
+    # 材料比例试验：固定题设对应的基准低损耗率阈值，比较 A/C 偏好约束的临界影响。
+    for a_min, c_max, loss_weight in product(a_min_values, c_max_values, loss_weights):
+        evaluate(float(a_min), float(c_max), float(loss_weight), max_loss_rate, "材料比例敏感性")
+
+    # 阈值试验：固定基准材料偏好，只改变允许使用的低损耗转运商集合。
+    for threshold, loss_weight in product(threshold_values, loss_weights):
+        evaluate(base_a_min, base_c_max, float(loss_weight), float(threshold), "低损耗率阈值敏感性")
     return pd.DataFrame.from_records(records)

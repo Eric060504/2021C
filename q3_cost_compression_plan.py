@@ -1,4 +1,4 @@
-﻿"""问题 3：带材料偏好约束的降本方案与敏感性分析。"""
+"""问题 3：带材料偏好约束的降本方案与敏感性分析。"""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,7 @@ from config import (
     Q3_SENSITIVITY_A_MIN,
     Q3_SENSITIVITY_C_MAX,
     Q3_SENSITIVITY_LOSS_WEIGHT,
+    Q3_SENSITIVITY_LOSS_THRESHOLD,
     SAFETY_WEEKS,
     TRANSPORT_LOSS_BUFFER_RATE,
     WEEKS_PLAN,
@@ -42,6 +43,7 @@ from visualization import (
     plot_inventory_trace,
     plot_material_comparison,
     plot_material_structure,
+    plot_loss_threshold_sensitivity,
     plot_sensitivity_heatmaps,
 )
 
@@ -107,7 +109,7 @@ def run_question_3(output_dir: Path | None = None, generate_plots: bool = True) 
     order_result = build_order_result_frame(plan["orders"], all_supplier_ids)
     transport_result = build_transport_result_frame(allocation, all_supplier_ids, carrier_loss.index.astype(str).tolist())
     order_path, transport_path = write_combined_question_workbooks(3, order_result, transport_result)
-    # 对三类关键偏好参数进行全组合敏感性分析。
+    # 采用控制变量法分别分析材料偏好参数和低损耗率阈值。
     sensitivity = run_sensitivity_grid(
         forecasts,
         PRODUCT_CAPACITY,
@@ -120,6 +122,9 @@ def run_question_3(output_dir: Path | None = None, generate_plots: bool = True) 
         weeks=WEEKS_PLAN,
         carrier_loss_rates=carrier_loss,
         max_loss_rate=Q3_LOW_LOSS_THRESHOLD,
+        loss_thresholds=Q3_SENSITIVITY_LOSS_THRESHOLD,
+        baseline_a_min=Q3_A_MIN_SHARE,
+        baseline_c_max=Q3_C_MAX_SHARE,
     )
     sensitivity.to_csv(output_dir / "sensitivity_analysis.csv", index=False, encoding="utf-8-sig")
     material = plan["material_product_equivalent"]
@@ -146,6 +151,9 @@ def run_question_3(output_dir: Path | None = None, generate_plots: bool = True) 
             ]
         )
         figure_paths.extend(plot_sensitivity_heatmaps(sensitivity, figure_dir / "sensitivity"))
+        threshold_figure = plot_loss_threshold_sensitivity(sensitivity, figure_dir / "loss_threshold_sensitivity.png")
+        if threshold_figure is not None:
+            figure_paths.append(threshold_figure)
         q2_material_share_path = output_dir.parent / "q2" / "material_share.xlsx"
         if q2_material_share_path.exists():
             q2_material_share = pd.read_excel(q2_material_share_path)

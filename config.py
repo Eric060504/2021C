@@ -41,10 +41,12 @@ Q3_A_REWARD = 0.08
 Q3_C_PENALTY = 0.12
 Q3_LOW_LOSS_THRESHOLD = 0.02
 Q3_LOSS_WEIGHT = 0.65
-Q3_SENSITIVITY_A_MIN = (0.45, 0.50, 0.55)
-Q3_SENSITIVITY_C_MAX = (0.10, 0.15, 0.20)
+# A/C 网格覆盖当前最优解附近的约束临界区间，并保留基准方案参数。
+Q3_SENSITIVITY_A_MIN = (0.50, 0.70, 0.75, 0.80, 0.825, 0.85, 0.90)
+Q3_SENSITIVITY_C_MAX = (0.001, 0.002, 0.0025, 0.005, 0.01, 0.15)
 Q3_SENSITIVITY_LOSS_WEIGHT = (0.50, 0.65, 0.80)
-
+# 对低损耗率硬阈值单独采用控制变量法，识别合格运力的可行性边界。
+Q3_SENSITIVITY_LOSS_THRESHOLD = (0.005, 0.007, 0.010, 0.015, 0.020)
 # 问题 4 的各材料产品当量最低占比约束。
 # 题目未给出具体最低占比，因此默认取 0，不额外限制基础模型。
 Q4_MIN_PRODUCT_SHARES = {"A": 0.0, "B": 0.0, "C": 0.0}

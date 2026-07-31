@@ -1,4 +1,4 @@
-﻿"""数学建模结果的统一绘图工具。"""
+"""数学建模结果的统一绘图工具。"""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -206,35 +206,108 @@ def plot_carrier_loss_threshold(loss_rates: pd.DataFrame, path: Path, threshold:
 
 
 def plot_sensitivity_heatmaps(sensitivity: pd.DataFrame, output_dir: Path) -> list[Path]:
-    """按低损耗权重分别绘制成本和可行性敏感性热力图。"""
+    """针对材料比例试验，按低损耗权重绘制成本和可行性热力图。"""
+    required = {"A类最低占比", "C类最高占比", "低损耗权重", "可行", "目标成本"}
+    missing = required - set(sensitivity.columns)
+    if missing:
+        raise ValueError(f"敏感性结果缺少列: {sorted(missing)}")
     output_dir = Path(output_dir)
+    data = sensitivity.copy()
+    if "试验类型" in data.columns:
+        data = data.loc[data["试验类型"] == "材料比例敏感性"].copy()
+    if data.empty:
+        return []
+
+    all_costs = pd.to_numeric(data["目标成本"], errors="coerce").dropna() / 10_000.0
+    cost_min = float(all_costs.min()) if not all_costs.empty else 0.0
+    cost_max = float(all_costs.max()) if not all_costs.empty else 1.0
+    if cost_max - cost_min <= EPSILON:
+        cost_min -= 0.01
+        cost_max += 0.01
+
     paths: list[Path] = []
-    for loss_weight, group in sensitivity.groupby("低损耗权重", sort=True):
-        cost = group.pivot(index="C类最高占比", columns="A类最低占比", values="目标成本")
+    for loss_weight, group in data.groupby("低损耗权重", sort=True):
+        cost = group.pivot(index="C类最高占比", columns="A类最低占比", values="目标成本") / 10_000.0
         feasible = group.pivot(index="C类最高占比", columns="A类最低占比", values="可行").astype(float)
         for label, matrix, cmap, color_label in (
-            ("成本", cost, "YlOrRd", "标准化目标成本"),
+            ("成本", cost, "YlOrRd", "标准化目标成本（万元）"),
             ("可行性", feasible, "YlGn", "可行（1）/不可行（0）"),
         ):
-            fig, ax = plt.subplots(figsize=(6.5, 5))
-            image = ax.imshow(matrix.to_numpy(), origin="lower", aspect="auto", cmap=cmap)
+            fig, ax = plt.subplots(figsize=(8.4, 5.8))
+            if label == "成本":
+                image = ax.imshow(matrix.to_numpy(), origin="lower", aspect="auto", cmap=cmap, vmin=cost_min, vmax=cost_max)
+            else:
+                image = ax.imshow(matrix.to_numpy(), origin="lower", aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
             ax.set_xticks(np.arange(len(matrix.columns)))
-            ax.set_xticklabels([f"{value:.0%}" for value in matrix.columns])
+            ax.set_xticklabels([f"{value:.1%}" for value in matrix.columns])
             ax.set_yticks(np.arange(len(matrix.index)))
-            ax.set_yticklabels([f"{value:.0%}" for value in matrix.index])
+            ax.set_yticklabels([f"{value:.2%}" for value in matrix.index])
             ax.set_xlabel("A类最低占比")
             ax.set_ylabel("C类最高占比")
-            ax.set_title(f"问题3：{label}敏感性（低损耗权重={loss_weight:.2f}）")
+            ax.set_title(f"问题3：{label}敏感性（低损耗权重={loss_weight:.2f}，阈值固定）")
             for row in range(matrix.shape[0]):
                 for column in range(matrix.shape[1]):
                     value = matrix.iloc[row, column]
-                    text = "不可行" if pd.isna(value) else (f"{value:.2f}" if label == "成本" else ("可行" if value >= 0.5 else "不可行"))
-                    ax.text(column, row, text, ha="center", va="center", fontsize=8)
+                    text = "不可行" if pd.isna(value) else (f"{value:.4f}" if label == "成本" else ("可行" if value >= 0.5 else "不可行"))
+                    ax.text(column, row, text, ha="center", va="center", fontsize=7)
             fig.colorbar(image, ax=ax, label=color_label)
             filename = f"sensitivity_{label}_loss_weight_{loss_weight:.2f}.png"
             paths.append(_save(fig, output_dir / filename))
     return paths
 
+
+def plot_loss_threshold_sensitivity(sensitivity: pd.DataFrame, path: Path) -> Path | None:
+    """绘制固定材料偏好下低损耗率阈值对可行性和合格运力的影响。"""
+    if "试验类型" not in sensitivity.columns:
+        return None
+    data = sensitivity.loc[sensitivity["试验类型"] == "低损耗率阈值敏感性"].copy()
+    if data.empty:
+        return None
+    data["低损耗率阈值"] = pd.to_numeric(data["低损耗率阈值"], errors="coerce")
+    data["目标成本"] = pd.to_numeric(data["目标成本"], errors="coerce")
+    data["最少合格转运商数"] = pd.to_numeric(data.get("最少合格转运商数"), errors="coerce")
+    data["可行"] = data["可行"].astype(bool)
+
+    fig, (ax_cost, ax_carrier) = plt.subplots(1, 2, figsize=(12, 4.8), sharex=True)
+    colors = plt.cm.Set2(np.linspace(0.0, 1.0, data["低损耗权重"].nunique()))
+    for color, (loss_weight, group) in zip(colors, data.groupby("低损耗权重", sort=True)):
+        group = group.sort_values("低损耗率阈值")
+        feasible = group["可行"] & group["目标成本"].notna()
+        ax_cost.plot(
+            group.loc[feasible, "低损耗率阈值"] * 100.0,
+            group.loc[feasible, "目标成本"] / 10_000.0,
+            marker="o",
+            color=color,
+            label=f"权重={loss_weight:.2f}",
+        )
+        ax_carrier.plot(
+            group["低损耗率阈值"] * 100.0,
+            group["最少合格转运商数"],
+            marker="o",
+            color=color,
+            label=f"权重={loss_weight:.2f}",
+        )
+        if (~feasible).any():
+            ax_carrier.scatter(
+                group.loc[~feasible, "低损耗率阈值"] * 100.0,
+                np.zeros((~feasible).sum()),
+                marker="x",
+                color="#C00000",
+                s=60,
+                zorder=3,
+            )
+    ax_cost.set_title("问题3：阈值对成本的影响")
+    ax_cost.set_xlabel("低损耗率阈值（%）")
+    ax_cost.set_ylabel("标准化目标成本（万元）")
+    ax_cost.grid(alpha=0.25)
+    ax_cost.legend(title="低损耗权重")
+    ax_carrier.set_title("问题3：阈值对合格运力的影响")
+    ax_carrier.set_xlabel("低损耗率阈值（%）")
+    ax_carrier.set_ylabel("每周最少合格转运商数")
+    ax_carrier.grid(alpha=0.25)
+    ax_carrier.legend(title="低损耗权重")
+    ax_carrier.text(0.02, 0.03, "红色叉号：该阈值下转运方案不可行", transform=ax_carrier.transAxes, color="#C00000", fontsize=8)
+    return _save(fig, path)
 
 def plot_capacity_comparison(current_capacity: float, maximum_capacity: float, path: Path) -> Path:
     """绘制当前产能与最大可持续产能对比图。"""
