@@ -1,4 +1,4 @@
-# 2021 C 题：生产企业原材料订购与运输（Python 求解）
+﻿# 2021 C 题：生产企业原材料订购与运输（Python 求解）
 
 本项目依据 `2021_C.docx` 的建模框架，对供应商重要性评价、最少供应商选择、24 周订购与转运、成本压缩及产能提升四个问题进行可复现求解。原始 Excel 附件不会被修改，生成的订购与转运结果统一写入 `outputs/`。
 
@@ -92,7 +92,7 @@
 
 测试覆盖数据读写、单位换算、供货与损耗预测、熵权排序、供应商筛选、库存安全约束、转运容量、低损耗率阈值、材料比例约束、时变运力接口、模板保护和真实附件结果复核。
 
-最近一次完整测试结果：**17 passed**。
+最近一次完整测试结果：**19 passed**。
 
 ```powershell
 & 'D:\anaconda\envs\LLM_Classification\python.exe' -X utf8 -m pytest -v
@@ -112,3 +112,46 @@
 1. 供应能力和损耗率均由历史数据的稳健统计量预测，属于建模假设，应在论文中说明。
 2. 当前附件中的转运能力为常数，因此按最小周总运力处理与逐周运力约束等价；若未来输入存在明显时变运力，当前模型可保证保守可行，但未利用跨周库存完全挖掘动态运力。
 3. 若要求严格禁止供应商周发运量拆分，应在后续模型中加入供应商—转运商二元分配变量；当前真实附件结果没有发生拆分。
+
+## 自动化审计、可视化与一键运行
+
+每次运行问题 2、3、4 时，程序会在对应 `outputs/q*` 目录额外写出：
+
+- `solution_audit.xlsx`：库存安全、转运运力、预测损耗、供应商拆分和材料比例约束的统一审计表；
+- `carrier_utilization.xlsx`：转运商逐周运输量、运力上限与利用率；
+- `supplier_split_report.xlsx`：供应商单周发运量是否拆分给多个转运商；
+- `material_share.xlsx`：A/B/C 类材料的周度产品当量与占比。
+
+默认还会在 `outputs/figures/` 下生成论文可用的 PNG 图表：
+
+| 问题 | 自动生成的主要图表 |
+|---|---|
+| 问题 1 | 熵权柱状图、前 20 家供应商得分图、前 50 家指标热力图 |
+| 问题 2 | 库存与到厂量图、转运商利用率热力图、入选供应商能力图、材料结构图 |
+| 问题 3 | 库存图、材料结构图、低损耗阈值图、转运商利用率图、参数敏感性热力图、问题 2/3 材料结构对比图 |
+| 问题 4 | 当前与最大可持续产能对比图、库存图、转运商利用率图、材料结构图 |
+
+可一键完成四问求解、审计和制图：
+
+```powershell
+& 'D:\anaconda\envs\LLM_Classification\python.exe' -X utf8 run_all.py
+```
+
+如只需重新求解而不生成图片：
+
+```powershell
+& 'D:\anaconda\envs\LLM_Classification\python.exe' -X utf8 run_all.py --no-plot
+```
+
+各问题脚本同样支持 `--output-dir` 与 `--no-plot` 参数，例如：
+
+```powershell
+& 'D:\anaconda\envs\LLM_Classification\python.exe' -X utf8 q3_cost_compression_plan.py --no-plot
+```
+
+新增模块：
+
+- `reporting.py`：统一生成可行性审计表和转运利用率等明细；
+- `visualization.py`：统一生成适合论文使用的静态图表；
+- `run_all.py`：按问题 1 至问题 4 的顺序运行模型，并输出 `outputs/overall_summary.xlsx`。
+

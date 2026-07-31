@@ -1,11 +1,13 @@
-"""问题 3：带材料偏好约束的降本方案与敏感性分析。"""
+﻿"""问题 3：带材料偏好约束的降本方案与敏感性分析。"""
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
 
 from config import (
+    CARRIER_WEEKLY_CAPACITY,
     OUTPUT_ROOT,
     PRODUCT_CAPACITY,
     Q3_A_MIN_SHARE,
@@ -33,10 +35,19 @@ from optimization import (
     solve_preference_order_plan,
 )
 from q1_supplier_importance import compute_supplier_indicators, entropy_weight_score
+from reporting import build_material_share_report, build_solution_audit, export_solution_reports
+from visualization import (
+    plot_carrier_loss_threshold,
+    plot_carrier_utilization,
+    plot_inventory_trace,
+    plot_material_comparison,
+    plot_material_structure,
+    plot_sensitivity_heatmaps,
+)
 
 
 # 在重要供应商范围内实施材料偏好约束的降本优化，并进行敏感性分析。
-def run_question_3(output_dir: Path | None = None) -> dict[str, object]:
+def run_question_3(output_dir: Path | None = None, generate_plots: bool = True) -> dict[str, object]:
     output_dir = Path(output_dir or OUTPUT_ROOT / "q3")
     output_dir.mkdir(parents=True, exist_ok=True)
     order, supply, loss = read_input_data()
@@ -72,6 +83,27 @@ def run_question_3(output_dir: Path | None = None) -> dict[str, object]:
     for _, row in plan["material_product_equivalent"].iterrows():
         if not check_material_share_constraints(row.to_dict(), Q3_A_MIN_SHARE, Q3_C_MAX_SHARE):
             raise AssertionError("问题3材料偏好比例未满足")
+    material_share = build_material_share_report(plan["material_product_equivalent"])
+    audit, utilization, split_report = build_solution_audit(
+        actual_inventory=actual_inventory,
+        safety_inventory=safety,
+        allocation=allocation,
+        carrier_capacity=CARRIER_WEEKLY_CAPACITY,
+        loss_rates=carrier_loss,
+        max_loss_rate=Q3_LOW_LOSS_THRESHOLD,
+        material_share_report=material_share,
+        material_constraints={"A": Q3_A_MIN_SHARE},
+        material_upper_constraints={"C": Q3_C_MAX_SHARE},
+    )
+    report_paths = export_solution_reports(
+        output_dir,
+        audit=audit,
+        utilization=utilization,
+        split_report=split_report,
+        material_share_report=material_share,
+    )
+    if not (audit["判定"] != "不通过").all():
+        raise AssertionError("问题3方案审计未通过")
     order_result = build_order_result_frame(plan["orders"], all_supplier_ids)
     transport_result = build_transport_result_frame(allocation, all_supplier_ids, carrier_loss.index.astype(str).tolist())
     order_path, transport_path = write_combined_question_workbooks(3, order_result, transport_result)
@@ -102,11 +134,49 @@ def run_question_3(output_dir: Path | None = None) -> dict[str, object]:
     pd.DataFrame({"周": actual_inventory.index, "实际到厂产品当量": actual_receipts.values, "实际库存产品当量": actual_inventory.values}).to_excel(
         output_dir / "inventory_trace.xlsx", index=False
     )
-    return {"plan": plan, "allocation": allocation, "actual_inventory": actual_inventory, "order_path": order_path, "transport_path": transport_path, "sensitivity": sensitivity}
+    figure_paths: list[Path] = []
+    if generate_plots:
+        figure_dir = output_dir.parent / "figures" / output_dir.name
+        figure_paths.extend(
+            [
+                plot_inventory_trace(actual_inventory, safety, PRODUCT_CAPACITY, figure_dir / "inventory_trace.png", "问题3：库存与实际到厂量", actual_receipts),
+                plot_carrier_utilization(utilization, figure_dir / "carrier_utilization_heatmap.png", "问题3：低损耗转运商周利用率"),
+                plot_material_structure(material_share, figure_dir / "material_structure_by_week.png", "问题3：周度材料产品当量结构", Q3_A_MIN_SHARE, Q3_C_MAX_SHARE),
+                plot_carrier_loss_threshold(carrier_loss, figure_dir / "carrier_loss_threshold.png", Q3_LOW_LOSS_THRESHOLD, allocation),
+            ]
+        )
+        figure_paths.extend(plot_sensitivity_heatmaps(sensitivity, figure_dir / "sensitivity"))
+        q2_material_share_path = output_dir.parent / "q2" / "material_share.xlsx"
+        if q2_material_share_path.exists():
+            q2_material_share = pd.read_excel(q2_material_share_path)
+            figure_paths.append(plot_material_comparison(q2_material_share, material_share, figure_dir / "q2_q3_material_comparison.png"))
+    return {
+        "plan": plan,
+        "allocation": allocation,
+        "actual_receipts": actual_receipts,
+        "actual_inventory": actual_inventory,
+        "audit": audit,
+        "utilization": utilization,
+        "material_share": material_share,
+        "report_paths": report_paths,
+        "figure_paths": figure_paths,
+        "order_path": order_path,
+        "transport_path": transport_path,
+        "sensitivity": sensitivity,
+    }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="运行问题3成本压缩订购与转运模型")
+    parser.add_argument("--output-dir", type=Path, default=None, help="结果输出目录")
+    parser.add_argument("--no-plot", action="store_true", help="不生成图表")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    result = run_question_3()
-    print("问题3完成：已生成偏好约束的降本方案与敏感性分析。")
+    args = _parse_args()
+    result = run_question_3(args.output_dir, generate_plots=not args.no_plot)
+    print("问题3完成：已生成偏好约束的降本方案、审计、敏感性分析和论文图表。")
     print(f"附件A：{result['order_path']}")
     print(f"附件B：{result['transport_path']}")
+

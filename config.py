@@ -4,6 +4,7 @@ from pathlib import Path
 # 项目根目录及题目附件、最终结果文件的位置。
 ROOT = Path(__file__).resolve().parent
 OUTPUT_ROOT = ROOT / "outputs"
+FIGURE_ROOT = OUTPUT_ROOT / "figures"
 SUPPLIER_XLSX = ROOT / "附件1 近5年402家供应商的相关数据.xlsx"
 CARRIER_XLSX = ROOT / "附件2 近5年8家转运商的相关数据.xlsx"
 ORDER_TEMPLATE_XLSX = ROOT / "附件A 订购方案数据结果.xlsx"
