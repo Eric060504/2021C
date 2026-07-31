@@ -325,6 +325,49 @@ def plot_capacity_comparison(current_capacity: float, maximum_capacity: float, p
     return _save(fig, path)
 
 
+# 汇总逐周预测供给、订购发运与转运能力，直观展示跨周库存调节过程。
+def plot_weekly_supply_and_shipment(
+    supplier_capacity_by_week: pd.DataFrame,
+    shipments: pd.DataFrame,
+    carrier_capacity_by_week: pd.Series,
+    path: Path,
+    title: str,
+) -> Path:
+    """绘制预测可供货量、计划发运量和逐周转运能力。"""
+    weeks = pd.Index(shipments.columns, dtype=int)
+    available = supplier_capacity_by_week.reindex(columns=weeks, fill_value=0.0).sum(axis=0)
+    planned = shipments.reindex(columns=weeks, fill_value=0.0).sum(axis=0)
+    carrier = carrier_capacity_by_week.reindex(weeks).astype(float)
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.plot(weeks, available.values, marker="o", linewidth=2, color="#4C78A8", label="预测可供货量")
+    ax.plot(weeks, planned.values, marker="s", linewidth=2, color="#F28E2B", label="计划发运量")
+    ax.plot(weeks, carrier.values, linestyle="--", linewidth=2, color="#59A14F", label="总转运能力")
+    ax.fill_between(weeks, planned.values, available.values, where=available.values >= planned.values, color="#4C78A8", alpha=0.12, label="未使用供给余量")
+    ax.set_title(title)
+    ax.set_xlabel("周次")
+    ax.set_ylabel("原料体积（m³）")
+    ax.set_xticks(weeks)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best", ncol=2)
+    return _save(fig, path)
+
+
+# 保留问题4专用入口，兼容既有调用代码。
+def plot_q4_weekly_supply_plan(
+    supplier_capacity_by_week: pd.DataFrame,
+    shipments: pd.DataFrame,
+    carrier_capacity_by_week: pd.Series,
+    path: Path,
+) -> Path:
+    """绘制问题4的预测可供货量、计划发运量和逐周转运能力。"""
+    return plot_weekly_supply_and_shipment(
+        supplier_capacity_by_week,
+        shipments,
+        carrier_capacity_by_week,
+        path,
+        "问题4：未来24周供给预测与订购发运动态方案",
+    )
+
 def plot_selected_supplier_capacity(selected_forecasts: pd.DataFrame, path: Path) -> Path:
     """绘制问题2入选供应商的预测产品当量能力。"""
     data = selected_forecasts.copy()

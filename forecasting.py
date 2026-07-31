@@ -10,6 +10,9 @@ from config import (
     LOSS_RATE_FALLBACK,
     SUPPLIER_CAPACITY_QUANTILE,
     CARRIER_WEEKLY_CAPACITY,
+    Q4_SUPPLY_FORECAST_LOWER_MULTIPLIER,
+    Q4_SUPPLY_FORECAST_SHRINKAGE,
+    Q4_SUPPLY_FORECAST_UPPER_MULTIPLIER,
     WEEKS_PLAN,
 )
 from data_io import MATERIAL, SUPPLIER_ID, week_columns
@@ -112,6 +115,54 @@ def build_supplier_forecasts(
         }
         for week in range(1, weeks + 1):
             record[week] = capacity
+        records.append(record)
+    return pd.DataFrame.from_records(records).set_index(SUPPLIER_ID, drop=False)
+
+
+# 将近期供货的周度起伏收缩到稳健能力附近，生成“供应商 × 未来周次”的动态可供货上限。
+def build_supplier_weekly_capacity_forecast(
+    order: pd.DataFrame,
+    supply: pd.DataFrame,
+    weeks: int = WEEKS_PLAN,
+    shrinkage: float = Q4_SUPPLY_FORECAST_SHRINKAGE,
+    lower_multiplier: float = Q4_SUPPLY_FORECAST_LOWER_MULTIPLIER,
+    upper_multiplier: float = Q4_SUPPLY_FORECAST_UPPER_MULTIPLIER,
+) -> pd.DataFrame:
+    """预测规划期内每家供应商的逐周可供货上限。
+
+    以最近 ``weeks`` 周的实际供货波动作为短期预测轮廓，并向历史高分位稳健能力收缩，
+    从而同时保留周度差异和避免直接复制个别异常周。第 ``t`` 周预测为
+    ``capacity × [shrinkage + (1 - shrinkage) × profile_t]``；其中 ``profile_t``
+    是近期第 ``t`` 周供货量相对于近期均值的比值，并经过上下界截断。
+    """
+    if weeks <= 0:
+        raise ValueError("预测周数必须为正")
+    if not 0.0 <= shrinkage <= 1.0:
+        raise ValueError("收缩系数必须在 [0, 1] 内")
+    if lower_multiplier <= 0.0 or upper_multiplier < lower_multiplier:
+        raise ValueError("周度能力倍数上下界不合法")
+    if order[SUPPLIER_ID].tolist() != supply[SUPPLIER_ID].tolist():
+        raise ValueError("订货和供货数据的供应商行顺序不一致")
+
+    columns = [col for col in week_columns() if col in supply.columns]
+    if not columns:
+        raise ValueError("供货数据缺少历史周列")
+    records: list[dict[str, object]] = []
+    for idx, supplier_id in enumerate(supply[SUPPLIER_ID]):
+        history = _numeric_series(supply.loc[idx, columns]).to_numpy(dtype=float)
+        capacity = estimate_supplier_capacity(history)
+        recent = history[-min(weeks, len(history)) :]
+        if len(recent) < weeks:
+            recent = np.pad(recent, (weeks - len(recent), 0), mode="edge")
+        recent_mean = float(np.mean(recent))
+        if capacity <= 1e-9 or recent_mean <= 1e-9:
+            forecast = np.zeros(weeks, dtype=float)
+        else:
+            profile = np.clip(recent / recent_mean, lower_multiplier, upper_multiplier)
+            multiplier = shrinkage + (1.0 - shrinkage) * profile
+            forecast = capacity * multiplier
+        record: dict[str, object] = {SUPPLIER_ID: str(supplier_id)}
+        record.update({week: float(value) for week, value in enumerate(forecast, start=1)})
         records.append(record)
     return pd.DataFrame.from_records(records).set_index(SUPPLIER_ID, drop=False)
 

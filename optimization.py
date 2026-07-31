@@ -72,14 +72,49 @@ def select_minimum_suppliers(suppliers: pd.DataFrame, demand: float, transport_l
     return selected
 
 
+# 将标量、序列或“转运商 × 周次”矩阵统一为规划期内的周度总量序列。
+def _weekly_total_vector(
+    value: float | Sequence[float] | pd.Series | pd.DataFrame,
+    weeks: int,
+    name: str,
+) -> np.ndarray:
+    if np.isscalar(value):
+        result = np.full(weeks, float(value), dtype=float)
+    elif isinstance(value, pd.DataFrame):
+        missing = set(range(1, weeks + 1)) - set(value.columns)
+        if missing:
+            raise ValueError(f"{name}缺少周列: {sorted(missing)}")
+        result = value.loc[:, range(1, weeks + 1)].apply(pd.to_numeric, errors="coerce").sum(axis=0).to_numpy(float)
+    else:
+        series = pd.to_numeric(pd.Series(value), errors="coerce")
+        if len(series) != weeks:
+            raise ValueError(f"{name}长度必须等于规划周数 {weeks}")
+        result = series.to_numpy(float)
+    if not np.isfinite(result).all() or (result < 0.0).any():
+        raise ValueError(f"{name}必须是非负有限值")
+    return result
+
+
+# 将供应商静态能力或“供应商 × 周次”预测矩阵统一为逐周发运上限。
+def _supplier_capacity_matrix(data: pd.DataFrame, weeks: int) -> np.ndarray:
+    week_columns = list(range(1, weeks + 1))
+    if set(week_columns).issubset(data.columns):
+        matrix = data.loc[:, week_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(float)
+    else:
+        matrix = np.repeat(data["capacity"].to_numpy(float)[:, None], weeks, axis=1)
+    if not np.isfinite(matrix).all() or (matrix < 0.0).any():
+        raise ValueError("供应商周度能力必须是非负有限值")
+    return matrix
+
+
 # 建立跨周的线性规划：决策发运量和期末库存，最小化采购、运输与库存成本。
 def _solve_shipments(
     suppliers: pd.DataFrame,
-    demand: float,
+    demand: float | Sequence[float] | pd.Series,
     weeks: int,
     initial_inventory: float,
     safety_inventory: float,
-    carrier_capacity_total: float,
+    carrier_capacity_total: float | Sequence[float] | pd.Series | pd.DataFrame,
     transport_loss_rate: float,
     preference: Mapping[str, float] | None,
 ) -> dict[str, object]:
@@ -87,14 +122,20 @@ def _solve_shipments(
     n = len(data)
     if n == 0:
         raise OptimizationError("不存在可用供应商")
-    if demand <= 0 or weeks <= 0:
-        raise ValueError("需求和计划期必须为正")
+    if weeks <= 0:
+        raise ValueError("计划期必须为正")
+    demand_by_week = _weekly_total_vector(demand, weeks, "周需求")
+    if (demand_by_week <= 0.0).any():
+        raise ValueError("周需求必须为正")
+    if initial_inventory < 0.0 or safety_inventory < 0.0:
+        raise ValueError("初始库存和安全库存必须非负")
     if not 0 <= transport_loss_rate < 1:
         raise ValueError("运输损耗率必须在 [0,1) 内")
 
     materials = data[MATERIAL].tolist()
     eta = data["delivery_rate"].to_numpy(float)
-    cap = data["capacity"].to_numpy(float)
+    capacity_by_week = _supplier_capacity_matrix(data, weeks)
+    carrier_by_week = _weekly_total_vector(carrier_capacity_total, weeks, "周转运总能力")
     # 发运 1 m³ 各类原料在扣除规划损耗后对应的产品当量。
     product_factor = np.array([(1.0 - transport_loss_rate) / MATERIAL_CONSUMPTION[m] for m in materials])
     # 问题 3 通过 A 类奖励和 C 类惩罚修正采购成本。
@@ -114,26 +155,26 @@ def _solve_shipments(
         objective[t * n : (t + 1) * n] = shipment_cost
         objective[inventory_offset + t] = UNIT_HOLDING_COST
 
-    # 等式约束为逐周库存平衡：期末库存 = 上期库存 + 到厂量 - 需求。
+    # 等式约束为逐周库存平衡：期末库存 = 上期库存 + 到厂量 - 当周需求。
     a_eq, b_eq = [], []
     for t in range(weeks):
         row = np.zeros(total_variables)
         row[t * n : (t + 1) * n] = -product_factor
         row[inventory_offset + t] = 1.0
         if t == 0:
-            b_eq.append(initial_inventory - demand)
+            b_eq.append(initial_inventory - demand_by_week[t])
         else:
             row[inventory_offset + t - 1] = -1.0
-            b_eq.append(-demand)
+            b_eq.append(-demand_by_week[t])
         a_eq.append(row)
 
-    # 不等式约束先加入每周总发运量不超过总转运能力。
+    # 每周总发运量不超过相应周次的总转运能力。
     a_ub, b_ub = [], []
     for t in range(weeks):
         row = np.zeros(total_variables)
         row[t * n : (t + 1) * n] = 1.0
         a_ub.append(row)
-        b_ub.append(carrier_capacity_total)
+        b_ub.append(carrier_by_week[t])
 
     # 仅问题 3 启用 A/C 材料构成比例约束。
     a_min = preference.get("a_min_share")
@@ -141,21 +182,17 @@ def _solve_shipments(
     for t in range(weeks):
         if a_min is not None:
             row = np.zeros(total_variables)
-            factors = product_factor.copy()
-            # A 类产品当量不低于总产品当量的 a_min 比例。
-            row[t * n : (t + 1) * n] = float(a_min) * factors - np.where(np.array(materials) == "A", factors, 0.0)
+            row[t * n : (t + 1) * n] = float(a_min) * product_factor - np.where(np.array(materials) == "A", product_factor, 0.0)
             a_ub.append(row)
             b_ub.append(0.0)
         if c_max is not None:
             row = np.zeros(total_variables)
-            factors = product_factor.copy()
-            # C 类产品当量不高于总产品当量的 c_max 比例。
-            row[t * n : (t + 1) * n] = np.where(np.array(materials) == "C", factors, 0.0) - float(c_max) * factors
+            row[t * n : (t + 1) * n] = np.where(np.array(materials) == "C", product_factor, 0.0) - float(c_max) * product_factor
             a_ub.append(row)
             b_ub.append(0.0)
 
-    # 发运量受供应商周能力约束；所有期末库存不得低于安全库存。
-    bounds = [(0.0, float(cap[i])) for _t in range(weeks) for i in range(n)] + [(float(safety_inventory), None)] * weeks
+    # 发运量受供应商逐周供货能力约束；所有期末库存不得低于安全库存。
+    bounds = [(0.0, float(capacity_by_week[i, t])) for t in range(weeks) for i in range(n)] + [(float(safety_inventory), None)] * weeks
     result = linprog(
         c=objective,
         A_ub=np.asarray(a_ub),
@@ -185,6 +222,9 @@ def _solve_shipments(
         "shipments": shipments,
         "inventory": inventory,
         "material_product_equivalent": material_equiv,
+        "demand_by_week": pd.Series(demand_by_week, index=range(1, weeks + 1), name="周生产需求"),
+        "supplier_capacity_by_week": pd.DataFrame(capacity_by_week, index=data.index, columns=range(1, weeks + 1)),
+        "carrier_capacity_by_week": pd.Series(carrier_by_week, index=range(1, weeks + 1), name="周转运总能力"),
         "objective": float(result.fun),
         "selected_suppliers": list(data.index),
         "transport_loss_rate": transport_loss_rate,
@@ -194,23 +234,24 @@ def _solve_shipments(
 # 问题 2/4 的基础订购模型：不附加材料偏好比例约束。
 def solve_order_plan(
     suppliers: pd.DataFrame,
-    demand: float,
+    demand: float | Sequence[float] | pd.Series,
     weeks: int = 24,
     initial_inventory: float | None = None,
     safety_inventory: float | None = None,
-    carrier_capacity_total: float = 8 * CARRIER_WEEKLY_CAPACITY,
+    carrier_capacity_total: float | Sequence[float] | pd.Series | pd.DataFrame = 8 * CARRIER_WEEKLY_CAPACITY,
     transport_loss_rate: float = 0.0,
 ) -> dict[str, object]:
     """在给定供应商集合下，最小化标准化采购、运输和库存持有成本。"""
-    safety = float(2.0 * demand if safety_inventory is None else safety_inventory)
+    demand_by_week = _weekly_total_vector(demand, weeks, "周需求")
+    safety = float(2.0 * demand_by_week.max() if safety_inventory is None else safety_inventory)
     initial = float(safety if initial_inventory is None else initial_inventory)
-    return _solve_shipments(suppliers, demand, weeks, initial, safety, carrier_capacity_total, transport_loss_rate, None)
+    return _solve_shipments(suppliers, demand_by_week, weeks, initial, safety, carrier_capacity_total, transport_loss_rate, None)
 
 
 # 问题 3 的订购模型：加入 A 类最低占比、C 类最高占比及采购奖惩。
 def solve_preference_order_plan(
     suppliers: pd.DataFrame,
-    demand: float,
+    demand: float | Sequence[float] | pd.Series,
     *,
     a_min_share: float,
     c_max_share: float,
@@ -219,13 +260,14 @@ def solve_preference_order_plan(
     weeks: int = 24,
     initial_inventory: float | None = None,
     safety_inventory: float | None = None,
-    carrier_capacity_total: float = 8 * CARRIER_WEEKLY_CAPACITY,
+    carrier_capacity_total: float | Sequence[float] | pd.Series | pd.DataFrame = 8 * CARRIER_WEEKLY_CAPACITY,
     transport_loss_rate: float = 0.0,
 ) -> dict[str, object]:
     # A 类为最低占比、C 类为最高占比，二者不是两个最低占比，因而不要求参数之和不超过 1。
     if not 0 <= a_min_share <= 1 or not 0 <= c_max_share <= 1:
         raise ValueError("A类下限和C类上限参数必须在 [0, 1] 内")
-    safety = float(2.0 * demand if safety_inventory is None else safety_inventory)
+    demand_by_week = _weekly_total_vector(demand, weeks, "周需求")
+    safety = float(2.0 * demand_by_week.max() if safety_inventory is None else safety_inventory)
     initial = float(safety if initial_inventory is None else initial_inventory)
     preference = {
         "a_min_share": a_min_share,
@@ -233,7 +275,7 @@ def solve_preference_order_plan(
         "a_reward": a_reward,
         "c_penalty": c_penalty,
     }
-    return _solve_shipments(suppliers, demand, weeks, initial, safety, carrier_capacity_total, transport_loss_rate, preference)
+    return _solve_shipments(suppliers, demand_by_week, weeks, initial, safety, carrier_capacity_total, transport_loss_rate, preference)
 
 
 # 独立复核单周产品当量的材料构成是否满足问题 3 的比例边界。
@@ -363,12 +405,18 @@ def post_loss_product_equivalent_by_week(
 
 
 # 依据库存平衡公式递推实际库存，用于核验安全库存约束。
-def inventory_from_receipts(receipts: pd.Series, demand: float, initial_inventory: float) -> pd.Series:
-    """按产品当量库存平衡关系递推库存序列。"""
+def inventory_from_receipts(
+    receipts: pd.Series,
+    demand: float | Sequence[float] | pd.Series,
+    initial_inventory: float,
+) -> pd.Series:
+    """按产品当量库存平衡关系递推库存序列，兼容恒定或逐周生产需求。"""
+    ordered_receipts = receipts.sort_index()
+    demand_by_week = _weekly_total_vector(demand, len(ordered_receipts), "周需求")
     inventory: dict[int, float] = {}
     current = float(initial_inventory)
-    for week, received in receipts.sort_index().items():
-        current += float(received) - float(demand)
+    for position, (week, received) in enumerate(ordered_receipts.items()):
+        current += float(received) - float(demand_by_week[position])
         inventory[int(week)] = current
     return pd.Series(inventory, name="inventory_product_equivalent")
 
@@ -464,6 +512,99 @@ def solve_max_sustainable_capacity(
         raise OptimizationError(f"Maximum sustainable capacity optimization failed: {result.message}")
     return float(-result.fun)
 
+
+# 在逐周供应、转运和安全库存约束下最大化整个规划期均可保持的固定周产能。
+def solve_dynamic_sustainable_capacity(
+    suppliers: pd.DataFrame,
+    *,
+    weeks: int,
+    carrier_capacity_total: float | Sequence[float] | pd.Series | pd.DataFrame = 8 * CARRIER_WEEKLY_CAPACITY,
+    transport_loss_rate: float = 0.0,
+    safety_weeks: float = 2.0,
+    material_min_shares: Mapping[str, float] | None = None,
+) -> float:
+    """求解具有周度供给波动时的最大可持续周产能。
+
+    将初始库存和每周期末安全库存均设为 ``safety_weeks × p``，其中 ``p`` 是待求的
+    固定周产能。该形式保留“长期稳定生产”的问题 4 口径，同时让供应商逐周能力和
+    转运能力通过库存跨周调节发挥作用。
+    """
+    if weeks <= 0:
+        raise ValueError("计划期必须为正")
+    if not 0.0 <= transport_loss_rate < 1.0:
+        raise ValueError("运输损耗率必须在 [0,1) 内")
+    if not np.isfinite(safety_weeks) or safety_weeks < 0.0:
+        raise ValueError("安全库存周数必须为非负有限值")
+    data = _ensure_supplier_frame(suppliers)
+    if data.empty:
+        raise OptimizationError("不存在可用供应商")
+    shares = _material_min_shares(material_min_shares)
+    n = len(data)
+    materials = data[MATERIAL].to_numpy(str)
+    factors = np.array([(1.0 - transport_loss_rate) / MATERIAL_CONSUMPTION[item] for item in materials])
+    supplier_capacity = _supplier_capacity_matrix(data, weeks)
+    carrier_capacity = _weekly_total_vector(carrier_capacity_total, weeks, "周转运总能力")
+
+    # 变量顺序为：固定周产能 p、供应商-周发运量、每周期末库存。
+    capacity_index = 0
+    shipment_offset = 1
+    shipment_variables = n * weeks
+    inventory_offset = shipment_offset + shipment_variables
+    total_variables = inventory_offset + weeks
+    objective = np.zeros(total_variables)
+    objective[capacity_index] = -1.0
+
+    # 逐周库存平衡。第 1 周的初始库存为 safety_weeks × p。
+    a_eq: list[np.ndarray] = []
+    b_eq: list[float] = []
+    for t in range(weeks):
+        row = np.zeros(total_variables)
+        row[shipment_offset + t * n : shipment_offset + (t + 1) * n] = -factors
+        row[inventory_offset + t] = 1.0
+        row[capacity_index] = 1.0 - safety_weeks if t == 0 else 1.0
+        if t > 0:
+            row[inventory_offset + t - 1] = -1.0
+        a_eq.append(row)
+        b_eq.append(0.0)
+
+    a_ub: list[np.ndarray] = []
+    b_ub: list[float] = []
+    for t in range(weeks):
+        # 每周总发运量不超过当周总转运能力。
+        row = np.zeros(total_variables)
+        row[shipment_offset + t * n : shipment_offset + (t + 1) * n] = 1.0
+        a_ub.append(row)
+        b_ub.append(carrier_capacity[t])
+        # 期末库存不低于 safety_weeks × p。
+        safety_row = np.zeros(total_variables)
+        safety_row[capacity_index] = safety_weeks
+        safety_row[inventory_offset + t] = -1.0
+        a_ub.append(safety_row)
+        b_ub.append(0.0)
+        for name, share in shares.items():
+            if share <= 1e-12:
+                continue
+            material_row = np.zeros(total_variables)
+            material_row[shipment_offset + t * n : shipment_offset + (t + 1) * n] = share * factors - np.where(materials == name, factors, 0.0)
+            a_ub.append(material_row)
+            b_ub.append(0.0)
+
+    bounds = [(0.0, None)]
+    bounds.extend((0.0, float(supplier_capacity[i, t])) for t in range(weeks) for i in range(n))
+    bounds.extend((0.0, None) for _ in range(weeks))
+    result = linprog(
+        c=objective,
+        A_ub=np.asarray(a_ub),
+        b_ub=np.asarray(b_ub),
+        A_eq=np.asarray(a_eq),
+        b_eq=np.asarray(b_eq),
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        raise OptimizationError(f"动态最大可持续产能优化不可行：{result.message}")
+    return float(result.x[capacity_index])
+
 def preference_loss_buffer(base_loss_rate: float, loss_weight: float) -> float:
     """将问题 3 的低损耗偏好权重映射为保守的规划损耗缓冲率。
 
@@ -502,9 +643,11 @@ def run_sensitivity_grid(
     c_penalty: float,
     transport_loss_rate: float,
     weeks: int = 24,
+    initial_inventory: float | None = None,
     carrier_loss_rates: pd.DataFrame | None = None,
     max_loss_rate: float | None = None,
     carrier_capacity: float | pd.Series | pd.DataFrame | Mapping[str, float] = CARRIER_WEEKLY_CAPACITY,
+    carrier_capacity_total: float | Sequence[float] | pd.Series | pd.DataFrame = 8 * CARRIER_WEEKLY_CAPACITY,
     loss_thresholds: Sequence[float] | None = None,
     baseline_a_min: float | None = None,
     baseline_c_max: float | None = None,
@@ -527,6 +670,9 @@ def run_sensitivity_grid(
     records: list[dict[str, object]] = []
     supplier_materials = suppliers[MATERIAL]
     safety_inventory = 2.0 * float(demand)
+    base_initial_inventory = safety_inventory if initial_inventory is None else float(initial_inventory)
+    if base_initial_inventory < safety_inventory - 1e-8:
+        raise ValueError("期初库存不得低于安全库存")
 
     def evaluate(a_min: float, c_max: float, loss_weight: float, threshold: float | None, experiment: str) -> None:
         record: dict[str, object] = {
@@ -546,8 +692,9 @@ def run_sensitivity_grid(
                 a_reward=a_reward,
                 c_penalty=c_penalty,
                 weeks=weeks,
-                initial_inventory=safety_inventory,
+                initial_inventory=base_initial_inventory,
                 safety_inventory=safety_inventory,
+                carrier_capacity_total=carrier_capacity_total,
                 transport_loss_rate=float(record["规划损耗缓冲率"]),
             )
             material = result["material_product_equivalent"]

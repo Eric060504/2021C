@@ -41,6 +41,7 @@ Q3_A_REWARD = 0.08
 Q3_C_PENALTY = 0.12
 Q3_LOW_LOSS_THRESHOLD = 0.02
 Q3_LOSS_WEIGHT = 0.65
+Q3_INITIAL_INVENTORY_WEEKS = 4.0  # 问题3动态供给情景下的期初库存周数，安全库存仍为 2 周。
 # A/C 网格覆盖当前最优解附近的约束临界区间，并保留基准方案参数。
 Q3_SENSITIVITY_A_MIN = (0.50, 0.70, 0.75, 0.80, 0.825, 0.85, 0.90)
 Q3_SENSITIVITY_C_MAX = (0.001, 0.002, 0.0025, 0.005, 0.01, 0.15)
@@ -50,6 +51,10 @@ Q3_SENSITIVITY_LOSS_THRESHOLD = (0.005, 0.007, 0.010, 0.015, 0.020)
 # 问题 4 的各材料产品当量最低占比约束。
 # 题目未给出具体最低占比，因此默认取 0，不额外限制基础模型。
 Q4_MIN_PRODUCT_SHARES = {"A": 0.0, "B": 0.0, "C": 0.0}
+# 问题 4 的逐周供给预测参数：近期周度轮廓向稳健能力收缩，并截断异常波动。
+Q4_SUPPLY_FORECAST_SHRINKAGE = 0.50
+Q4_SUPPLY_FORECAST_LOWER_MULTIPLIER = 0.50
+Q4_SUPPLY_FORECAST_UPPER_MULTIPLIER = 1.50
 
 # 数值计算中用于判定零值和比较约束是否满足的容差。
 EPSILON = 1e-7
